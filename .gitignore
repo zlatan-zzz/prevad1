@@ -1,0 +1,67 @@
+# === 1. Python 环境与编译文件 ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+ENV/
+
+# === 2. 实验数据与大文件 (非常重要！) ===
+# 建议将所有原始数据和训练好的模型放在特定文件夹，并排除它们
+data/
+datasets/
+model/
+models/
+weights/
+checkpoint/
+# 排除常见的权重文件格式
+*.pth
+*.h5
+*.ckpt
+*.pb
+*.onnx
+*.zip
+*.tar.gz
+*.rar
+
+# === 3. 日志与输出结果 ===
+logs/
+*.log
+results/
+output/
+figures/
+.tensorboard/
+
+# === 4. 编辑器与系统文件 ===
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# === 5. 配置文件与秘钥 ===
+.env
+auth.json
+config.ini
+# 如果你有特定的私密配置文件，请单独添加
