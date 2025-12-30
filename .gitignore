@@ -65,3 +65,5 @@ Thumbs.db
 auth.json
 config.ini
 # 如果你有特定的私密配置文件，请单独添加
+/src/tmp/original_loss
+/src/tmp/
