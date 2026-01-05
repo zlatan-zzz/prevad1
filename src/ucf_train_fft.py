@@ -129,7 +129,7 @@ def train(model, normal_loader, anomaly_loader, testloader, args, label_map, dev
 
     # [新增] 初始化 TF-VAD 损失函数
     # 参数可根据实验调整，这里给出一组推荐值
-    criterion = TFVADLoss(alpha=1.0, beta=1.0, gamma=0.1, margin=10.0).to(device)
+    criterion = TFVADLoss(alpha=1.0, beta=1.0, gamma=0.001, margin=100.0).to(device)
 
     prompt_text = get_prompt_text(label_map)
     ap_best = 0
@@ -211,7 +211,7 @@ def train(model, normal_loader, anomaly_loader, testloader, args, label_map, dev
         scheduler.step()
 
         # 保存当前 Epoch 模型
-        torch.save(model.state_dict(), 'model/model_fft_cur.pth')
+        torch.save(model.state_dict(), 'model1/model_fft_cur.pth')
         # 重载最优模型以保证训练稳定性 (可选策略)
         # checkpoint = torch.load(args.checkpoint_path, weights_only=False)
         # model.load_state_dict(checkpoint['model_state_dict'])
