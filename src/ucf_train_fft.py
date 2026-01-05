@@ -5,12 +5,10 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 import numpy as np
 import random
-# 跳过ssl
 import ssl
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# 假设 model.py 中已经包含了修改后的 CLIPVAD 类 (带 SCDA 和 dist_to_anchor 输出)
 from model_fft import CLIPVAD
 from ucf_test_fft import test
 from utils.dataset import UCFDataset
@@ -18,104 +16,60 @@ from utils.tools import get_prompt_text, get_batch_label
 import ucf_option
 
 
-# =========================================================================
-# [新增] TF-VAD 核心损失函数模块
-# 替代原有的 CLASM 和 CLAS2，实现 Ranking + Semantic + Center Loss
-# =========================================================================
-class TFVADLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=1.0, gamma=0.5, margin=100.0):
-        super(TFVADLoss, self).__init__()
-        self.alpha = alpha  # Ranking Loss 权重
-        self.beta = beta  # Semantic Class Loss 权重
-        self.gamma = gamma  # Center Loss 权重 (核心创新)
-        self.margin = margin
-        self.ce_loss = nn.CrossEntropyLoss()
+# ==========================================
+# 原作者的 Loss 函数 (保持不变)
+# ==========================================
 
-    def forward(self, logits1, logits2, dist_to_anchor, text_labels, lengths):
-        """
-        logits1: [B, T, 1] - 异常评分
-        logits2: [B, T, K] - 语义相似度
-        dist_to_anchor: [B, T] - 到 Normal Anchor 的距离
-        text_labels: [B, ClassNum] - One-hot 标签 (index 0 is Normal)
-        """
-        # --- 1. 数据预处理 ---
-        # 这里的 text_labels 是 One-hot 的。
-        # Normal 样本: text_labels[:, 0] == 1
-        # Anomaly 样本: text_labels[:, 0] == 0
-        is_normal = (text_labels[:, 0] == 1)
-        is_anomaly = (text_labels[:, 0] == 0)
+def CLASM(logits, labels, lengths, device):
+    """
+    语义分类 Loss (Semantic Class Loss)
+    logits: [B, T, K]
+    labels: [B, K] (One-hot)
+    """
+    instance_logits = torch.zeros(0).to(device)
+    # 归一化 Label，防止数值问题
+    labels = labels / (torch.sum(labels, dim=1, keepdim=True) + 1e-8)
+    labels = labels.to(device)
 
-        # 生成 Mask 处理 Padding (长度之外的设为忽略)
-        batch_size, max_len = logits1.shape[:2]
-        mask = torch.arange(max_len, device=logits1.device).expand(batch_size, max_len) < lengths.unsqueeze(1)
+    # Top-K Pooling (K = T // 16 + 1)
+    for i in range(logits.shape[0]):
+        tmp, _ = torch.topk(logits[i, 0:lengths[i]], k=int(lengths[i] / 16 + 1), largest=True, dim=0)
+        instance_logits = torch.cat([instance_logits, torch.mean(tmp, 0, keepdim=True)], dim=0)
 
-        # 将 Padding 区域的 Logits 设为极小值，以免干扰 Max 计算
-        logits1_masked = logits1.squeeze(-1).clone()
-        logits1_masked[~mask] = -1e9
+    # CrossEntropy (实现为 LogSoftmax + NLL)
+    milloss = -torch.mean(torch.sum(labels * F.log_softmax(instance_logits, dim=1), dim=1), dim=0)
+    return milloss
 
-        # --- 2. MIL Ranking Loss (对应原代码的 loss1/CLAS2) ---
-        # 逻辑: 异常视频最高分 > 正常视频最高分 + Margin
-        top_scores, _ = torch.max(logits1_masked, dim=1)  # [B]
 
-        normal_scores = top_scores[is_normal]
-        anomaly_scores = top_scores[is_anomaly]
+def CLAS2(logits, labels, lengths, device):
+    """
+    二分类排序 Loss (Binary MIL Loss)
+    logits: [B, T, 1] - 异常评分
+    labels: [B, K] - One-hot，需要转为二分类标签
+    """
+    instance_logits = torch.zeros(0).to(device)
+    # 将 One-hot 转为 Binary Label (0: Normal, 1: Anomaly)
+    # labels[:, 0]是Normal列。如果是Normal(1)，则 target=0；如果是Anomaly(0)，则 target=1。
+    labels = 1 - labels[:, 0].reshape(labels.shape[0])
+    labels = labels.to(device)
 
-        loss_rank = torch.tensor(0.0, device=logits1.device)
-        if len(normal_scores) > 0 and len(anomaly_scores) > 0:
-            # Hinge Loss: max(0, margin + max_norm - max_ano)
-            # 我们希望 max_ano 越大越好，max_norm 越小越好
-            loss_rank = torch.relu(self.margin + normal_scores.mean() - anomaly_scores.mean())
+    # Sigmoid 激活
+    logits = torch.sigmoid(logits).reshape(logits.shape[0], logits.shape[1])
 
-        # --- 3. Semantic Classification Loss (对应原代码的 loss2/CLASM) ---
-        # 逻辑: 异常视频中最显著的那一帧，应该被分类为正确的异常类别
-        loss_cls = torch.tensor(0.0, device=logits1.device)
-        if is_anomaly.sum() > 0:
-            # 获取异常样本的真实类别索引 (0-13, 0是Normal, 所以要 -1 得到 0-12 的异常类索引)
-            # text_labels[is_anomaly] shape: [N_ano, 14] -> argmax -> indices 1~13
-            ano_labels_raw = torch.argmax(text_labels[is_anomaly], dim=1)
-            ano_cls_targets = ano_labels_raw - 1  # Shift to 0-based for CE Loss
+    # Top-K Pooling
+    for i in range(logits.shape[0]):
+        tmp, _ = torch.topk(logits[i, 0:lengths[i]], k=int(lengths[i] / 16 + 1), largest=True)
+        tmp = torch.mean(tmp).view(1)
+        instance_logits = torch.cat([instance_logits, tmp], dim=0)
 
-            # 找到异常得分最高的帧索引
-            _, max_indices = torch.max(logits1_masked[is_anomaly], dim=1)  # [N_ano]
+    # BCE Loss
+    clsloss = F.binary_cross_entropy(instance_logits, labels)
+    return clsloss
 
-            # 取出这些帧对应的语义预测 logits2
-            # logits2 shape: [B, T, K_anomaly]
-            # 我们需要 gather [N_ano, K_anomaly]
-            # 注意: logits2 只有异常类别的维度 (通常 13 类)
 
-            # 这是一个 tricky 的点: 需要确认 logits2 的最后一维大小。
-            # 原代码中 logits2 是 visual @ text。text 包括 Normal。
-            # 如果 logits2 包含 Normal 类，我们需要排除它，或者根据 model 输出调整。
-            # 假设 model 输出的 logits2 对应所有 prompt (14类)。
-
-            logits2_ano_samples = logits2[is_anomaly]  # [N_ano, T, 14]
-            # 选取 Max Frame
-            pred_cls_frames = logits2_ano_samples[torch.arange(logits2_ano_samples.size(0)), max_indices]
-
-            # 去掉第0列 (Normal)，只看异常类的分布，或者直接对全类做 CE
-            # 这里为了对齐语义，我们让它预测具体的异常类 (1-13)
-            # 既然 target 是 1-13，我们切片 logits 取 [:, 1:]
-            pred_cls_abnormal = pred_cls_frames[:, 1:]
-
-            if pred_cls_abnormal.shape[1] == ano_cls_targets.max() + 1:
-                loss_cls = self.ce_loss(pred_cls_abnormal, ano_cls_targets)
-
-        # --- 4. Hypersphere Center Loss (TF-VAD 核心创新) ---
-        # 逻辑: 正常视频的所有有效帧，距离 Normal Anchor 应该尽可能近
-        loss_center = torch.tensor(0.0, device=logits1.device)
-        if is_normal.sum() > 0:
-            normal_dists = dist_to_anchor[is_normal]  # [N_norm, T]
-            normal_masks = mask[is_normal]  # [N_norm, T]
-
-            # 只计算非 Padding 区域
-            valid_dists = normal_dists[normal_masks]
-            if valid_dists.numel() > 0:
-                loss_center = torch.mean(valid_dists ** 2)
-
-        # 总损失
-        total_loss = self.alpha * loss_rank + self.beta * loss_cls + self.gamma * loss_center
-        return total_loss, loss_rank, loss_cls, loss_center
-
+# ==========================================
+# 训练主循环
+# ==========================================
 
 def train(model, normal_loader, anomaly_loader, testloader, args, label_map, device):
     model.to(device)
@@ -123,18 +77,15 @@ def train(model, normal_loader, anomaly_loader, testloader, args, label_map, dev
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)
 
-    # 初始化优化器
+    # 优化器
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = MultiStepLR(optimizer, args.scheduler_milestones, args.scheduler_rate)
-
-    # [新增] 初始化 TF-VAD 损失函数
-    # 参数可根据实验调整，这里给出一组推荐值
-    criterion = TFVADLoss(alpha=1.0, beta=1.0, gamma=0.001, margin=100.0).to(device)
-
     prompt_text = get_prompt_text(label_map)
+
     ap_best = 0
     epoch = 0
 
+    # 加载 Checkpoint
     if args.use_checkpoint == True:
         checkpoint = torch.load(args.checkpoint_path, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -144,62 +95,85 @@ def train(model, normal_loader, anomaly_loader, testloader, args, label_map, dev
         print("checkpoint info:")
         print("epoch:", epoch + 1, " ap:", ap_best)
 
+    # --- 超参数设置 (根据之前的实验分析调整) ---
+    gamma = 0.001  # Center Loss 权重 (用于平衡 500+ 的数值)
+
     for e in range(args.max_epoch):
         model.train()
-        # 记录器重置
-        loss_meter = {'total': 0, 'rank': 0, 'cls': 0, 'center': 0}
+        loss_total1 = 0
+        loss_total2 = 0
+        loss_total_center = 0
 
         normal_iter = iter(normal_loader)
         anomaly_iter = iter(anomaly_loader)
 
         for i in range(min(len(normal_loader), len(anomaly_loader))):
             step = 0
-            # 1. 数据加载与拼接
             normal_features, normal_label, normal_lengths = next(normal_iter)
             anomaly_features, anomaly_label, anomaly_lengths = next(anomaly_iter)
 
             visual_features = torch.cat([normal_features, anomaly_features], dim=0).to(device)
-            # 拼接长度
+            text_labels = list(normal_label) + list(anomaly_label)
             feat_lengths = torch.cat([normal_lengths, anomaly_lengths], dim=0).to(device)
+            text_labels = get_batch_label(text_labels, prompt_text, label_map).to(device)
 
-            # 处理标签: text_labels 是 one-hot 形式
-            raw_labels = list(normal_label) + list(anomaly_label)
-            text_labels = get_batch_label(raw_labels, prompt_text, label_map).to(device)
-
-            # 2. 模型前向传播 (注意接收第4个返回值 dist_to_anchor)
-            # text_features, logits1, logits2, dist_to_anchor
+            # --- 模型前向传播 ---
+            # 返回: 文本特征, 异常评分(logits1), 语义评分(logits2), 到中心的距离(dist_to_anchor)
             text_features, logits1, logits2, dist_to_anchor = model(visual_features, None, prompt_text, feat_lengths)
 
-            # 3. [修改] 使用 TF-VAD Loss 计算损失
-            loss, l_rank, l_cls, l_center = criterion(logits1, logits2, dist_to_anchor, text_labels, feat_lengths)
+            # --- 1. Ranking / Binary Loss (使用原作者 CLAS2) ---
+            loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
+            loss_total1 += loss1.item()
 
-            # 记录损失以便打印
-            loss_meter['total'] += loss.item()
-            loss_meter['rank'] += l_rank.item()
-            loss_meter['cls'] += l_cls.item()
-            loss_meter['center'] += l_center.item()
+            # --- 2. Semantic Class Loss (使用原作者 CLASM) ---
+            loss2 = CLASM(logits2, text_labels, feat_lengths, device)
+            loss_total2 += loss2.item()
 
-            # 4. 反向传播与优化
+            # --- 3. Hypersphere Center Loss (保留你的创新) ---
+            # 逻辑: 仅对 Normal 视频的有效帧计算距离平方和
+            loss_center = torch.tensor(0.0, device=device)
+
+            # 识别正常样本 (Index 0 is Normal)
+            is_normal = (text_labels[:, 0] == 1)
+
+            if is_normal.sum() > 0:
+                # 取出正常样本的距离 [N_norm, T]
+                normal_dists = dist_to_anchor[is_normal]
+                normal_lens = feat_lengths[is_normal]
+
+                # 生成 Mask 去掉 Padding (True表示有效区域)
+                # normal_dists.shape[1] 是 Time 维度
+                max_len = normal_dists.shape[1]
+                mask = torch.arange(max_len, device=device).unsqueeze(0) < normal_lens.unsqueeze(1)
+
+                # 只计算有效帧的 Loss
+                valid_dists = normal_dists[mask]
+                if valid_dists.numel() > 0:
+                    loss_center = torch.mean(valid_dists ** 2)
+
+            loss_total_center += loss_center.item()
+
+            # --- 总 Loss ---
+            # 如果你想保留原作者对 Text Feature 的正交约束(loss3)，也可以加回来，但这里为了简洁只保留你的核心逻辑
+            loss = loss1 + loss2 + gamma * loss_center
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             step += i * normal_loader.batch_size * 2
 
-            # 5. 打印日志与测试
+            # --- 打印日志 & 测试 ---
             if step % 1280 == 0 and step != 0:
-                print(f"epoch: {e + 1} | step: {step} | "
-                      f"Total: {loss_meter['total'] / (i + 1):.4f} | "
-                      f"Rank: {loss_meter['rank'] / (i + 1):.4f} | "
-                      f"Cls: {loss_meter['cls'] / (i + 1):.4f} | "
-                      f"Center: {loss_meter['center'] / (i + 1):.4f}")
+                print(f'epoch: {e + 1} | step: {step} | '
+                      f'Rank(Loss1): {loss_total1 / (i + 1):.4f} | '
+                      f'Cls(Loss2): {loss_total2 / (i + 1):.4f} | '
+                      f'Center: {loss_total_center / (i + 1):.4f}')
 
-                # 测试代码保持不变 (注意: test 函数内部可能需要适配新的模型返回值，但如果 test 只用 logits1，通常兼容)
-                # 如果 ucf_test.py 里的 test 函数里调用 model 没解包第4个参数，可能会报错
-                # 建议在 ucf_test.py 中也做类似修改: _, logits, _, _ = model(...)
                 AUC, AP = test(model, testloader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, device)
 
-                if AUC > ap_best:  # 这里通常用 AUC 或 AP 作为保存标准
+                # 通常 WSVAD 使用 AUC 作为主要指标，这里保留原逻辑用 AP 保存
+                if AUC > ap_best:
                     ap_best = AUC
                     checkpoint = {
                         'epoch': e,
@@ -210,19 +184,19 @@ def train(model, normal_loader, anomaly_loader, testloader, args, label_map, dev
 
         scheduler.step()
 
-        # 保存当前 Epoch 模型
-        torch.save(model.state_dict(), 'model1/model_fft_cur.pth')
-        # 重载最优模型以保证训练稳定性 (可选策略)
-        # checkpoint = torch.load(args.checkpoint_path, weights_only=False)
-        # model.load_state_dict(checkpoint['model_state_dict'])
+        torch.save(model.state_dict(), 'model1/model_cur.pth')
+        # 重新加载最好的模型继续训练 (防止过拟合)
+        if args.use_checkpoint:
+            checkpoint = torch.load(args.checkpoint_path, weights_only=False)
+            model.load_state_dict(checkpoint['model_state_dict'])
 
-    # 训练结束保存最终模型
-    if args.use_checkpoint:
-        checkpoint = torch.load(args.checkpoint_path, weights_only=False)
-        torch.save(checkpoint['model_state_dict'], args.model_path)
-    else:
-        torch.save(model.state_dict(), args.model_path)
+    checkpoint = torch.load(args.checkpoint_path, weights_only=False)
+    torch.save(checkpoint['model_state_dict'], args.model_path)
 
+
+# ==========================================
+# 辅助函数 (保持不变)
+# ==========================================
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -233,6 +207,9 @@ def setup_seed(seed):
 
 if __name__ == '__main__':
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 如果要指定第二张显卡，取消下面注释
+    # device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+
     args = ucf_option.parser.parse_args()
     setup_seed(args.seed)
 
@@ -249,7 +226,6 @@ if __name__ == '__main__':
     test_dataset = UCFDataset(args.visual_length, args.test_list, True, label_map)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    # 确保这里的 CLIPVAD 是修改后的包含 TF-VAD 模块的版本
     model = CLIPVAD(args.classes_num, args.embed_dim, args.visual_length, args.visual_width, args.visual_head,
                     args.visual_layers, args.attn_window, args.prompt_prefix, args.prompt_postfix, device)
 
